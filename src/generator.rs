@@ -4,9 +4,9 @@ use rand::seq::SliceRandom;
 use crate::grid::{Grid, PuzzleState};
 use crate::solver::count_solutions;
 
-#[derive(Clone, Copy, Debug)]
-#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Difficulty {
+    #[default]
     Easy,
     Medium,
     Hard,
@@ -18,6 +18,24 @@ impl Difficulty {
             Difficulty::Easy => (36, 45),
             Difficulty::Medium => (27, 35),
             Difficulty::Hard => (22, 26),
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Difficulty::Easy => Difficulty::Medium,
+            Difficulty::Medium => Difficulty::Hard,
+            Difficulty::Hard => Difficulty::Easy,
+        }
+    }
+}
+
+impl std::fmt::Display for Difficulty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Difficulty::Easy => write!(f, "Easy"),
+            Difficulty::Medium => write!(f, "Medium"),
+            Difficulty::Hard => write!(f, "Hard"),
         }
     }
 }

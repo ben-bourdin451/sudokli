@@ -44,6 +44,17 @@ impl Grid {
         true
     }
 
+    /// Returns the set of valid candidate values for an empty cell.
+    /// Returns empty vec if the cell is already filled.
+    pub fn candidates(&self, row: usize, col: usize) -> Vec<u8> {
+        if self.cells[row][col] != 0 {
+            return vec![];
+        }
+        (1..=9)
+            .filter(|&v| self.is_valid_placement(row, col, v))
+            .collect()
+    }
+
     /// Check if the grid is completely filled with a valid solution.
     #[allow(dead_code)]
     pub fn is_complete_and_valid(&self) -> bool {
@@ -153,5 +164,22 @@ mod tests {
         let mut g = Grid::empty();
         g.set(1, 1, 5);
         assert!(!g.is_valid_placement(0, 0, 5));
+    }
+
+    #[test]
+    fn candidates_empty_cell() {
+        let mut g = Grid::empty();
+        // Place 1-8 in row 0, cols 1-8
+        for v in 1..=8 {
+            g.set(0, v as usize, v);
+        }
+        // Only 9 is valid at (0,0)
+        assert_eq!(g.candidates(0, 0), vec![9]);
+    }
+
+    #[test]
+    fn candidates_filled_cell_returns_empty() {
+        let g = solved_grid();
+        assert_eq!(g.candidates(0, 0), vec![]);
     }
 }
