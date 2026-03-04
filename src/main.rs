@@ -1,23 +1,36 @@
+mod generator;
+mod grid;
+mod solver;
+
 use std::io;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use ratatui::{
+    DefaultTerminal, Frame,
     layout::{Constraint, Flex, Layout},
-    style::{Color, Stylize},
+    style::{Color, Style, Stylize},
     text::Text,
     widgets::{Block, Borders, Cell, Row, Table},
-    DefaultTerminal, Frame,
 };
 
+use generator::{Difficulty, generate_puzzle};
+use grid::{Grid, PuzzleState};
+
 struct App {
-    grid: [[u8; 9]; 9],
+    grid: Grid,
+    givens: [[bool; 9]; 9],
     running: bool,
 }
 
 impl App {
     fn new() -> Self {
+        let mut rng = StdRng::from_os_rng();
+        let PuzzleState { grid, givens } = generate_puzzle(Difficulty::Easy, &mut rng);
         Self {
-            grid: [[0; 9]; 9],
+            grid,
+            givens,
             running: true,
         }
     }
@@ -37,7 +50,7 @@ impl App {
             .map(|r| {
                 let cells: Vec<Cell> = (0..9)
                     .map(|c| {
-                        let val = self.grid[r][c];
+                        let val = self.grid.get(r, c);
                         let text = if val == 0 {
                             " ".to_string()
                         } else {
@@ -47,6 +60,9 @@ impl App {
                         // Add subtle separator coloring for 3x3 boxes
                         if (r / 3 + c / 3) % 2 == 0 {
                             cell = cell.bg(Color::DarkGray);
+                        }
+                        if self.givens[r][c] {
+                            cell = cell.style(Style::default().bold());
                         }
                         cell
                     })
