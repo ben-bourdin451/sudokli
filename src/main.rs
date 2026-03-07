@@ -12,7 +12,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table},
 };
 
 use generator::{Difficulty, generate_puzzle};
@@ -39,6 +39,7 @@ struct App {
     cursor_col: usize,
     hints: Vec<(usize, usize, u8)>,
     hint_index: usize,
+    show_errors: bool,
 }
 
 impl App {
@@ -55,6 +56,7 @@ impl App {
             cursor_col: 0,
             hints: Vec::new(),
             hint_index: 0,
+            show_errors: false,
         }
     }
 
@@ -75,6 +77,16 @@ impl App {
         } else {
             self.hint_index = self.hint_index.min(self.hints.len() - 1);
         }
+    }
+
+    fn error_count(&self) -> usize {
+        (0..9)
+            .flat_map(|r| (0..9).map(move |c| (r, c)))
+            .filter(|&(r, c)| {
+                let val = self.grid.get(r, c);
+                val != 0 && !self.givens[r][c] && !self.grid.is_valid_placement(r, c, val)
+            })
+            .count()
     }
 
     fn generate_puzzle(&mut self) {
@@ -124,7 +136,7 @@ impl App {
     fn draw_status_line(&self, frame: &mut Frame, area: Rect) {
         let text = match self.mode {
             Mode::Menu => "  ↑↓ Navigate  Enter Select  q Quit",
-            Mode::Playing => "  ↑↓←→ Move  1-9 Set  Bksp Clear  ? Hint  Tab Fill  q Menu",
+            Mode::Playing => "  ↑↓←→ Move  1-9 Set  Bksp Clear  ? Hint  Tab Fill  e Errors  q Menu",
         };
         let line = Line::from(Span::styled(
             text,
@@ -142,35 +154,24 @@ impl App {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        // Build menu lines with spacing
+        // Split inner area for progress bar at bottom when playing
+        let (content_area, progress_area) = if self.mode == Mode::Playing {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(1)])
+                .split(inner);
+            (chunks[0], Some(chunks[1]))
+        } else {
+            (inner, None)
+        };
+
         let mut lines: Vec<Line> = Vec::new();
         lines.push(Line::from(""));
 
-        for (i, &item) in MENU_ITEMS.iter().enumerate() {
-            let marker = if i == self.menu_index { "> " } else { "  " };
-            let label = match i {
-                0 => format!("[D]ifficulty: {}", self.difficulty),
-                1 => "[N]ew Puzzle".to_string(),
-                2 => "[P]lay".to_string(),
-                3 => "[Q]uit".to_string(),
-                _ => item.to_string(),
-            };
-
-            let style = if i == self.menu_index {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-
-            lines.push(Line::from(Span::styled(format!("{marker}{label}"), style)));
-            lines.push(Line::from(""));
-        }
-
-        // Hints section (play mode only)
         if self.mode == Mode::Playing {
-            lines.push(Line::from(""));
+            // Play mode: show hints and errors only (no menu items)
+
+            // Hints section
             lines.push(Line::from(Span::styled(
                 "── Hints ──────────────",
                 Style::default().fg(Color::DarkGray),
@@ -192,10 +193,64 @@ impl App {
                     Style::default().fg(Color::Cyan),
                 )));
             }
+
+            // Error count
+            let errors = self.error_count();
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "── Errors ─────────────",
+                Style::default().fg(Color::DarkGray),
+            )));
+            let (error_text, error_color) = if errors == 0 {
+                ("  Errors: 0".to_string(), Color::Green)
+            } else {
+                (format!("  Errors: {errors}"), Color::Red)
+            };
+            lines.push(Line::from(Span::styled(
+                error_text,
+                Style::default().fg(error_color),
+            )));
+        } else {
+            // Menu mode: show menu items
+            for (i, &item) in MENU_ITEMS.iter().enumerate() {
+                let marker = if i == self.menu_index { "> " } else { "  " };
+                let label = match i {
+                    0 => format!("[D]ifficulty: {}", self.difficulty),
+                    1 => "[N]ew Puzzle".to_string(),
+                    2 => "[P]lay".to_string(),
+                    3 => "[Q]uit".to_string(),
+                    _ => item.to_string(),
+                };
+
+                let style = if i == self.menu_index {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+
+                lines.push(Line::from(Span::styled(format!("{marker}{label}"), style)));
+                lines.push(Line::from(""));
+            }
         }
 
         let paragraph = Paragraph::new(lines);
-        frame.render_widget(paragraph, inner);
+        frame.render_widget(paragraph, content_area);
+
+        // Progress bar (play mode only, 1 row)
+        if let Some(progress_area) = progress_area {
+            let filled = (0..9)
+                .flat_map(|r| (0..9).map(move |c| (r, c)))
+                .filter(|&(r, c)| self.grid.get(r, c) != 0)
+                .count();
+            let ratio = filled as f64 / 81.0;
+            let gauge = Gauge::default()
+                .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
+                .ratio(ratio)
+                .label(format!("{filled}/81"));
+            frame.render_widget(gauge, progress_area);
+        }
     }
 
     fn draw_grid_panel(&self, frame: &mut Frame, area: Rect) {
@@ -236,6 +291,10 @@ impl App {
                                 hr == r && hc == c
                             };
                         let is_given = self.givens[r][c];
+                        let is_error = self.show_errors
+                            && val != 0
+                            && !is_given
+                            && !self.grid.is_valid_placement(r, c, val);
                         let box_shaded = (r / 3 + c / 3) % 2 == 0;
 
                         let style = if is_cursor {
@@ -246,6 +305,8 @@ impl App {
                             s
                         } else if is_hint {
                             Style::default().bg(Color::Cyan).fg(Color::Black)
+                        } else if is_error {
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
                         } else if is_given {
                             let mut s = Style::default().add_modifier(Modifier::BOLD);
                             if box_shaded {
@@ -380,6 +441,7 @@ impl App {
                     self.cursor_col = c;
                 }
             }
+            KeyCode::Char('e') => self.show_errors = !self.show_errors,
             KeyCode::Tab => {
                 if let Some(&(r, c, val)) = self.hints.get(self.hint_index) {
                     self.grid.set(r, c, val);
