@@ -15,10 +15,19 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table},
 };
 
-use generator::{Difficulty, generate_puzzle};
-use grid::{Grid, PuzzleState};
+use generator::{Difficulty, generate_killer_puzzle, generate_puzzle};
+use grid::{CageRenderInfo, Cage, GameMode, Grid, PuzzleState, compute_cage_render_info};
 
-const MENU_ITEMS: &[&str] = &["Difficulty", "New Puzzle", "Play", "Quit"];
+const MENU_ITEMS: &[&str] = &["Difficulty", "Mode", "New Puzzle", "Play", "Quit"];
+
+const CAGE_PALETTE: [Color; 6] = [
+    Color::Rgb(60, 60, 90),  // navy
+    Color::Rgb(70, 50, 70),  // plum
+    Color::Rgb(45, 70, 60),  // teal
+    Color::Rgb(80, 65, 45),  // amber
+    Color::Rgb(55, 55, 55),  // gray
+    Color::Rgb(70, 45, 55),  // rose
+];
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Mode {
@@ -32,6 +41,9 @@ struct App {
     givens: [[bool; 9]; 9],
     running: bool,
     difficulty: Difficulty,
+    game_mode: GameMode,
+    cages: Option<Vec<Cage>>,
+    cage_render: Option<CageRenderInfo>,
     menu_index: usize,
     has_puzzle: bool,
     mode: Mode,
@@ -49,6 +61,9 @@ impl App {
             givens: [[false; 9]; 9],
             running: true,
             difficulty: Difficulty::default(),
+            game_mode: GameMode::default(),
+            cages: None,
+            cage_render: None,
             menu_index: 0,
             has_puzzle: false,
             mode: Mode::default(),
@@ -91,9 +106,14 @@ impl App {
 
     fn generate_puzzle(&mut self) {
         let mut rng = StdRng::from_os_rng();
-        let PuzzleState { grid, givens } = generate_puzzle(self.difficulty, &mut rng);
+        let PuzzleState { grid, givens, cages } = match self.game_mode {
+            GameMode::Classic => generate_puzzle(self.difficulty, &mut rng),
+            GameMode::Killer => generate_killer_puzzle(self.difficulty, &mut rng),
+        };
         self.grid = grid;
         self.givens = givens;
+        self.cage_render = cages.as_ref().map(|c| compute_cage_render_info(c));
+        self.cages = cages;
         self.has_puzzle = true;
     }
 
@@ -216,9 +236,10 @@ impl App {
                 let marker = if i == self.menu_index { "> " } else { "  " };
                 let label = match i {
                     0 => format!("[D]ifficulty: {}", self.difficulty),
-                    1 => "[N]ew Puzzle".to_string(),
-                    2 => "[P]lay".to_string(),
-                    3 => "[Q]uit".to_string(),
+                    1 => format!("[M]ode: {}", self.game_mode),
+                    2 => "[N]ew Puzzle".to_string(),
+                    3 => "[P]lay".to_string(),
+                    4 => "[Q]uit".to_string(),
                     _ => item.to_string(),
                 };
 
@@ -272,10 +293,36 @@ impl App {
 
         let is_playing = self.mode == Mode::Playing;
 
-        let rows: Vec<Row> = (0..9)
-            .map(|r| {
-                let cells: Vec<Cell> = (0..9)
-                    .map(|c| {
+        // Grid rows 0-8, with spacer rows inserted at box boundaries
+        // Table row indices: 0,1,2 = grid 0,1,2; 3 = spacer; 4,5,6 = grid 3,4,5; 7 = spacer; 8,9,10 = grid 6,7,8
+        let grid_row_indices: [Option<usize>; 11] = [
+            Some(0), Some(1), Some(2), None,
+            Some(3), Some(4), Some(5), None,
+            Some(6), Some(7), Some(8),
+        ];
+        let grid_col_indices: [Option<usize>; 11] = [
+            Some(0), Some(1), Some(2), None,
+            Some(3), Some(4), Some(5), None,
+            Some(6), Some(7), Some(8),
+        ];
+
+        let rows: Vec<Row> = grid_row_indices
+            .iter()
+            .map(|maybe_r| {
+                if maybe_r.is_none() {
+                    // Spacer row: 11 empty cells
+                    return Row::new(vec![Cell::from(""); 11]).height(1);
+                }
+                let r = maybe_r.unwrap();
+
+                let cells: Vec<Cell> = grid_col_indices
+                    .iter()
+                    .map(|maybe_c| {
+                        if maybe_c.is_none() {
+                            return Cell::from("");
+                        }
+                        let c = maybe_c.unwrap();
+
                         let val = self.grid.get(r, c);
                         let text = if val == 0 {
                             " ".to_string()
@@ -295,7 +342,14 @@ impl App {
                             && val != 0
                             && !is_given
                             && !self.grid.is_valid_placement(r, c, val);
-                        let box_shaded = (r / 3 + c / 3) % 2 == 0;
+                        let bg_color: Option<Color> = if let Some(ref cr) = self.cage_render {
+                            let idx = cr.cage_colors[cr.cage_map[r][c]] as usize;
+                            Some(CAGE_PALETTE[idx])
+                        } else if (r / 3 + c / 3) % 2 == 0 {
+                            Some(Color::DarkGray)
+                        } else {
+                            None
+                        };
 
                         let style = if is_cursor {
                             let mut s = Style::default().bg(Color::Yellow).fg(Color::Black);
@@ -306,20 +360,46 @@ impl App {
                         } else if is_hint {
                             Style::default().bg(Color::Cyan).fg(Color::Black)
                         } else if is_error {
-                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-                        } else if is_given {
-                            let mut s = Style::default().add_modifier(Modifier::BOLD);
-                            if box_shaded {
-                                s = s.bg(Color::DarkGray);
+                            let mut s = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+                            if let Some(bg) = bg_color {
+                                s = s.bg(bg);
                             }
                             s
-                        } else if box_shaded {
-                            Style::default().bg(Color::DarkGray)
+                        } else if is_given {
+                            let mut s = Style::default().add_modifier(Modifier::BOLD);
+                            if let Some(bg) = bg_color {
+                                s = s.bg(bg);
+                            }
+                            s
                         } else {
-                            Style::default()
+                            let mut s = Style::default();
+                            if let Some(bg) = bg_color {
+                                s = s.bg(bg);
+                            }
+                            s
                         };
 
-                        Cell::from(Text::from(text).centered()).style(style)
+                        let is_label = self.cage_render.as_ref()
+                            .is_some_and(|cr| cr.label_cells[cr.cage_map[r][c]] == (r, c));
+
+                        let content = if is_label {
+                            let cr = self.cage_render.as_ref().unwrap();
+                            let sum = self.cages.as_ref().unwrap()[cr.cage_map[r][c]].sum;
+                            Text::from(vec![
+                                Line::from(Span::styled(
+                                    format!("{sum}"),
+                                    Style::default().add_modifier(Modifier::DIM),
+                                )),
+                                Line::from(text).centered(),
+                            ])
+                        } else {
+                            Text::from(vec![
+                                Line::from(""),
+                                Line::from(text).centered(),
+                            ])
+                        };
+
+                        Cell::from(content).style(style)
                     })
                     .collect();
 
@@ -327,7 +407,17 @@ impl App {
             })
             .collect();
 
-        let widths = [Constraint::Length(4); 9];
+        // 9 data columns (width 4) + 2 spacer columns (width 1)
+        let widths: Vec<Constraint> = grid_col_indices
+            .iter()
+            .map(|c| {
+                if c.is_some() {
+                    Constraint::Length(4)
+                } else {
+                    Constraint::Length(1)
+                }
+            })
+            .collect();
 
         let border_style = if is_playing {
             Style::default().fg(Color::Yellow)
@@ -338,15 +428,16 @@ impl App {
         let table = Table::new(rows, widths)
             .block(
                 Block::default()
-                    .title(" Sudoku ")
+                    .title(if self.game_mode == GameMode::Killer { " Killer " } else { " Sudoku " })
                     .borders(Borders::ALL)
                     .border_style(border_style),
             )
             .column_spacing(0);
 
         // Center the table in the panel
-        let table_width = 4 * 9 + 2;
-        let table_height = 2 * 9 + 2;
+        // 9 data cols * 4 + 2 spacer cols * 1 + 2 border
+        let table_width = 4 * 9 + 2 + 2; // 9 data cols * 4 + 2 spacers + 2 border
+        let table_height = 2 * 9 + 2 + 2; // 9 data rows * 2 + 2 spacers + 2 border
 
         let [vert] = Layout::vertical([Constraint::Length(table_height)])
             .flex(ratatui::layout::Flex::Center)
@@ -374,6 +465,7 @@ impl App {
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.running = false,
             KeyCode::Char('d') => self.difficulty = self.difficulty.next(),
+            KeyCode::Char('m') => self.game_mode = self.game_mode.next(),
             KeyCode::Char('n') => self.generate_puzzle(),
             KeyCode::Char('p') => self.enter_play_mode(),
             KeyCode::Up => {
@@ -388,9 +480,10 @@ impl App {
             }
             KeyCode::Enter => match self.menu_index {
                 0 => self.difficulty = self.difficulty.next(),
-                1 => self.generate_puzzle(),
-                2 => self.enter_play_mode(),
-                3 => self.running = false,
+                1 => self.game_mode = self.game_mode.next(),
+                2 => self.generate_puzzle(),
+                3 => self.enter_play_mode(),
+                4 => self.running = false,
                 _ => {}
             },
             _ => {}
