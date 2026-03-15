@@ -53,8 +53,8 @@ enum Command {
 struct PuzzleOutput {
     mode: String,
     difficulty: String,
-    grid: [[u8; 9]; 9],
-    givens: [[bool; 9]; 9],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grid: Option<[[u8; 9]; 9]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cages: Option<Vec<CageOutput>>,
 }
@@ -891,11 +891,17 @@ fn puzzle_to_output(state: &PuzzleState, mode: &str, difficulty: &str) -> Puzzle
             .collect()
     });
 
+    // For killer mode the grid is always empty — omit it
+    let grid = if state.cages.is_some() {
+        None
+    } else {
+        Some(*state.grid.cells())
+    };
+
     PuzzleOutput {
         mode: mode.to_string(),
         difficulty: difficulty.to_string(),
-        grid: *state.grid.cells(),
-        givens: state.givens,
+        grid,
         cages,
     }
 }
