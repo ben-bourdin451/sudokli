@@ -1,10 +1,14 @@
+use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use rand::Rng;
 use rand::seq::{IndexedRandom, SliceRandom};
 
 use crate::grid::{Cage, Grid, PuzzleState};
-use crate::solver::{count_solutions, count_solutions_killer};
+use crate::solver::{SolverResult, count_solutions, count_solutions_killer};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum Difficulty {
     #[default]
     Easy,
@@ -37,6 +41,15 @@ impl std::fmt::Display for Difficulty {
             Difficulty::Medium => write!(f, "Medium"),
             Difficulty::Hard => write!(f, "Hard"),
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct GenerationError;
+
+impl fmt::Display for GenerationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Failed to generate puzzle after maximum attempts")
     }
 }
 
@@ -111,29 +124,54 @@ fn remove_cells(grid: &mut Grid, target_clues: usize, rng: &mut impl Rng) {
     }
 }
 
+/// Node limit for solver during killer puzzle generation.
+/// If exceeded, the cage layout is skipped rather than running forever.
+const KILLER_NODE_LIMIT: u64 = 500_000;
+
+/// Maximum outer attempts (each generates a new solution grid).
+const MAX_OUTER_ATTEMPTS: usize = 50;
+
+/// Number of cage partitions to try per solution grid.
+const CAGE_ATTEMPTS_PER_SOLUTION: usize = 10;
+
+/// Total number of cage layout attempts for killer generation (for progress reporting).
+pub const KILLER_TOTAL_ATTEMPTS: u32 =
+    (MAX_OUTER_ATTEMPTS * CAGE_ATTEMPTS_PER_SOLUTION) as u32;
+
 /// Generate a killer sudoku puzzle: empty grid with cage constraints.
-/// Loops until a cage partition with a unique solution is found.
-pub fn generate_killer_puzzle(difficulty: Difficulty, rng: &mut impl Rng) -> PuzzleState {
-    let _ = difficulty; // reserved for future difficulty tuning
-    loop {
+/// Returns an error if no valid puzzle is found within the attempt budget.
+/// `progress` is atomically incremented after each cage layout attempt.
+pub fn generate_killer_puzzle(
+    difficulty: Difficulty,
+    rng: &mut impl Rng,
+    progress: &Arc<AtomicU32>,
+) -> Result<PuzzleState, GenerationError> {
+    for _ in 0..MAX_OUTER_ATTEMPTS {
         let mut solution = Grid::empty();
         fill_grid(&mut solution, rng);
 
         // Try multiple cage partitions per solution before regenerating
-        for _ in 0..10 {
-            let cages = generate_cages(&solution, rng);
-            if count_solutions_killer(&Grid::empty(), &cages, 2) == 1 {
-                return PuzzleState {
-                    grid: Grid::empty(),
-                    givens: [[false; 9]; 9],
-                    cages: Some(cages),
-                };
+        for _ in 0..CAGE_ATTEMPTS_PER_SOLUTION {
+            let cages = generate_cages(&solution, difficulty, rng);
+            let result = count_solutions_killer(&Grid::empty(), &cages, 2, KILLER_NODE_LIMIT);
+            progress.fetch_add(1, Ordering::Relaxed);
+            match result {
+                SolverResult::Complete(1) => {
+                    return Ok(PuzzleState {
+                        grid: Grid::empty(),
+                        givens: [[false; 9]; 9],
+                        cages: Some(cages),
+                    });
+                }
+                SolverResult::Exhausted => continue,
+                _ => continue,
             }
         }
     }
+    Err(GenerationError)
 }
 
-pub(crate) fn generate_cages(solution: &Grid, rng: &mut impl Rng) -> Vec<Cage> {
+pub(crate) fn generate_cages(solution: &Grid, difficulty: Difficulty, rng: &mut impl Rng) -> Vec<Cage> {
     let mut assigned = [[false; 9]; 9];
     let mut cages = Vec::new();
 
@@ -146,7 +184,7 @@ pub(crate) fn generate_cages(solution: &Grid, rng: &mut impl Rng) -> Vec<Cage> {
             continue;
         }
 
-        let target_size = pick_cage_size(rng);
+        let target_size = pick_cage_size(difficulty, rng);
         let mut cells = vec![(r, c)];
         assigned[r][c] = true;
         // Bitmask tracking digits already in this cage
@@ -177,7 +215,80 @@ pub(crate) fn generate_cages(solution: &Grid, rng: &mut impl Rng) -> Vec<Cage> {
         cages.push(Cage { cells, sum });
     }
 
+    // Merge single-cell cages into adjacent cages to avoid free givens.
+    // On Hard, always merge; on Medium, merge most; on Easy, keep them.
+    let merge_singles = match difficulty {
+        Difficulty::Easy => false,
+        Difficulty::Medium => true,
+        Difficulty::Hard => true,
+    };
+
+    if merge_singles {
+        merge_single_cell_cages(&mut cages, solution);
+    }
+
     cages
+}
+
+/// Merge each single-cell cage into an adjacent cage whose digits don't
+/// conflict, updating the sum accordingly.
+fn merge_single_cell_cages(cages: &mut Vec<Cage>, solution: &Grid) {
+    // Build a cell-to-cage-index lookup
+    let mut cell_cage: [[usize; 9]; 9] = [[usize::MAX; 9]; 9];
+    for (i, cage) in cages.iter().enumerate() {
+        for &(r, c) in &cage.cells {
+            cell_cage[r][c] = i;
+        }
+    }
+
+    // Collect indices of single-cell cages
+    let singles: Vec<usize> = cages
+        .iter()
+        .enumerate()
+        .filter(|(_, cage)| cage.cells.len() == 1)
+        .map(|(i, _)| i)
+        .collect();
+
+    for &si in &singles {
+        let (r, c) = cages[si].cells[0];
+        let digit = solution.get(r, c);
+
+        // Find an adjacent cage we can merge into (no duplicate digits)
+        let mut best: Option<usize> = None;
+        for (dr, dc) in [(-1i32, 0), (1, 0), (0, -1i32), (0, 1)] {
+            let nr = r as i32 + dr;
+            let nc = c as i32 + dc;
+            if !(0..9).contains(&nr) || !(0..9).contains(&nc) {
+                continue;
+            }
+            let (nr, nc) = (nr as usize, nc as usize);
+            let ni = cell_cage[nr][nc];
+            if ni == si || ni == usize::MAX {
+                continue;
+            }
+            // Check no digit conflict
+            let has_conflict = cages[ni]
+                .cells
+                .iter()
+                .any(|&(cr, cc)| solution.get(cr, cc) == digit);
+            if !has_conflict {
+                best = Some(ni);
+                break;
+            }
+        }
+
+        if let Some(target) = best {
+            // Move the cell from the single cage to the target cage
+            cages[target].cells.push((r, c));
+            cages[target].sum += digit;
+            cell_cage[r][c] = target;
+            cages[si].cells.clear();
+            cages[si].sum = 0;
+        }
+    }
+
+    // Remove emptied cages
+    cages.retain(|cage| !cage.cells.is_empty());
 }
 
 fn unassigned_neighbors(
@@ -202,14 +313,29 @@ fn unassigned_neighbors(
     result
 }
 
-fn pick_cage_size(rng: &mut impl Rng) -> usize {
+fn pick_cage_size(difficulty: Difficulty, rng: &mut impl Rng) -> usize {
     let roll: u8 = rng.random_range(0..100);
-    match roll {
-        0..5 => 1,
-        5..35 => 2,
-        35..70 => 3,
-        70..95 => 4,
-        _ => 5,
+    match difficulty {
+        Difficulty::Easy => match roll {
+            0..10 => 1,
+            10..45 => 2,
+            45..80 => 3,
+            80..95 => 4,
+            _ => 5,
+        },
+        Difficulty::Medium => match roll {
+            0..3 => 1,
+            3..28 => 2,
+            28..63 => 3,
+            63..90 => 4,
+            _ => 5,
+        },
+        Difficulty::Hard => match roll {
+            0..15 => 2,
+            15..45 => 3,
+            45..80 => 4,
+            _ => 5,
+        },
     }
 }
 
@@ -250,7 +376,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(100);
         let mut solution = Grid::empty();
         fill_grid(&mut solution, &mut rng);
-        let cages = generate_cages(&solution, &mut rng);
+        let cages = generate_cages(&solution, Difficulty::Medium, &mut rng);
 
         let mut covered = [[false; 9]; 9];
         for cage in &cages {
@@ -271,7 +397,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(200);
         let mut solution = Grid::empty();
         fill_grid(&mut solution, &mut rng);
-        let cages = generate_cages(&solution, &mut rng);
+        let cages = generate_cages(&solution, Difficulty::Medium, &mut rng);
 
         for (i, cage) in cages.iter().enumerate() {
             let mut seen = 0u16;
@@ -291,7 +417,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(300);
         let mut solution = Grid::empty();
         fill_grid(&mut solution, &mut rng);
-        let cages = generate_cages(&solution, &mut rng);
+        let cages = generate_cages(&solution, Difficulty::Medium, &mut rng);
 
         for (i, cage) in cages.iter().enumerate() {
             let actual_sum: u8 = cage.cells.iter().map(|&(r, c)| solution.get(r, c)).sum();
@@ -308,7 +434,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(400);
         let mut solution = Grid::empty();
         fill_grid(&mut solution, &mut rng);
-        let cages = generate_cages(&solution, &mut rng);
+        let cages = generate_cages(&solution, Difficulty::Medium, &mut rng);
 
         for (i, cage) in cages.iter().enumerate() {
             if cage.cells.len() <= 1 {
@@ -345,12 +471,11 @@ mod tests {
     #[test]
     fn generated_killer_puzzle_has_unique_solution() {
         let mut rng = StdRng::seed_from_u64(999);
-        let puzzle = generate_killer_puzzle(Difficulty::Easy, &mut rng);
+        let progress = Arc::new(AtomicU32::new(0));
+        let puzzle = generate_killer_puzzle(Difficulty::Easy, &mut rng, &progress).unwrap();
         let cages = puzzle.cages.as_ref().unwrap();
-        assert_eq!(
-            crate::solver::count_solutions_killer(&Grid::empty(), cages, 2),
-            1
-        );
+        let result = crate::solver::count_solutions_killer(&Grid::empty(), cages, 2, 0);
+        assert!(matches!(result, SolverResult::Complete(1)));
     }
 
     #[test]

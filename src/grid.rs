@@ -8,6 +8,10 @@ impl Grid {
         Self { cells: [[0; 9]; 9] }
     }
 
+    pub fn cells(&self) -> &[[u8; 9]; 9] {
+        &self.cells
+    }
+
     pub fn get(&self, row: usize, col: usize) -> u8 {
         self.cells[row][col]
     }
@@ -174,7 +178,7 @@ pub fn compute_cage_render_info(cages: &[Cage]) -> CageRenderInfo {
     }
 }
 
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum GameMode {
     #[default]
     Classic,
@@ -284,7 +288,7 @@ mod tests {
     #[test]
     fn candidates_filled_cell_returns_empty() {
         let g = solved_grid();
-        assert_eq!(g.candidates(0, 0), vec![]);
+        assert_eq!(g.candidates(0, 0), Vec::<u8>::new());
     }
 
     fn sample_cages() -> Vec<Cage> {

@@ -2,8 +2,14 @@ mod generator;
 mod grid;
 mod solver;
 
-use std::io;
+use std::fs;
+use std::io::{self, Write as _};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
+use clap::{Parser, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -15,8 +21,49 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Table},
 };
 
-use generator::{Difficulty, generate_killer_puzzle, generate_puzzle};
+use generator::{Difficulty, KILLER_TOTAL_ATTEMPTS, generate_killer_puzzle, generate_puzzle};
 use grid::{CageRenderInfo, Cage, GameMode, Grid, PuzzleState, compute_cage_render_info};
+
+#[derive(Parser)]
+#[command(name = "sudokli", version, about = "Terminal-based sudoku puzzle game")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Generate puzzles in batch and write to a JSON file
+    Generate {
+        /// Puzzle mode (classic or killer)
+        mode: GameMode,
+        /// Puzzle difficulty
+        #[arg(short, long, default_value = "easy")]
+        difficulty: Difficulty,
+        /// Number of puzzles to generate
+        #[arg(short, long, default_value_t = 1)]
+        count: usize,
+        /// Output file path
+        #[arg(long, default_value = "puzzles.json")]
+        output: String,
+    },
+}
+
+#[derive(serde::Serialize)]
+struct PuzzleOutput {
+    mode: String,
+    difficulty: String,
+    grid: [[u8; 9]; 9],
+    givens: [[bool; 9]; 9],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cages: Option<Vec<CageOutput>>,
+}
+
+#[derive(serde::Serialize)]
+struct CageOutput {
+    cells: Vec<[usize; 2]>,
+    sum: u8,
+}
 
 const MENU_ITEMS: &[&str] = &["Difficulty", "Mode", "New Puzzle", "Play", "Quit"];
 
@@ -36,6 +83,16 @@ enum Mode {
     Playing,
 }
 
+enum GenerationStatus {
+    Idle,
+    Generating {
+        rx: mpsc::Receiver<Result<PuzzleState, generator::GenerationError>>,
+        started: Instant,
+        progress: Arc<AtomicU32>,
+        total: u32,
+    },
+}
+
 struct App {
     grid: Grid,
     givens: [[bool; 9]; 9],
@@ -52,6 +109,8 @@ struct App {
     hints: Vec<(usize, usize, u8)>,
     hint_index: usize,
     show_errors: bool,
+    generation_status: GenerationStatus,
+    generation_error: Option<String>,
 }
 
 impl App {
@@ -72,6 +131,8 @@ impl App {
             hints: Vec::new(),
             hint_index: 0,
             show_errors: false,
+            generation_status: GenerationStatus::Idle,
+            generation_error: None,
         }
     }
 
@@ -104,31 +165,94 @@ impl App {
             .count()
     }
 
-    fn generate_puzzle(&mut self) {
-        let mut rng = StdRng::from_os_rng();
-        let PuzzleState { grid, givens, cages } = match self.game_mode {
-            GameMode::Classic => generate_puzzle(self.difficulty, &mut rng),
-            GameMode::Killer => generate_killer_puzzle(self.difficulty, &mut rng),
+    fn is_generating(&self) -> bool {
+        matches!(self.generation_status, GenerationStatus::Generating { .. })
+    }
+
+    fn start_generation(&mut self) {
+        self.generation_error = None;
+        let difficulty = self.difficulty;
+        let game_mode = self.game_mode;
+        let progress = Arc::new(AtomicU32::new(0));
+        let progress_clone = Arc::clone(&progress);
+
+        let total = match game_mode {
+            GameMode::Classic => 1,
+            GameMode::Killer => KILLER_TOTAL_ATTEMPTS,
         };
-        self.grid = grid;
-        self.givens = givens;
-        self.cage_render = cages.as_ref().map(|c| compute_cage_render_info(c));
-        self.cages = cages;
-        self.has_puzzle = true;
+
+        let (tx, rx) = mpsc::channel();
+        self.generation_status = GenerationStatus::Generating {
+            rx,
+            started: Instant::now(),
+            progress,
+            total,
+        };
+
+        std::thread::spawn(move || {
+            let mut rng = StdRng::from_os_rng();
+            let result = match game_mode {
+                GameMode::Classic => Ok(generate_puzzle(difficulty, &mut rng)),
+                GameMode::Killer => generate_killer_puzzle(difficulty, &mut rng, &progress_clone),
+            };
+            let _ = tx.send(result);
+        });
+    }
+
+    fn check_generation(&mut self) {
+        let received = match &self.generation_status {
+            GenerationStatus::Idle => return,
+            GenerationStatus::Generating { rx, .. } => rx.try_recv().ok(),
+        };
+
+        if let Some(result) = received {
+            self.generation_status = GenerationStatus::Idle;
+            match result {
+                Ok(PuzzleState { grid, givens, cages }) => {
+                    self.grid = grid;
+                    self.givens = givens;
+                    self.cage_render = cages.as_ref().map(|c| compute_cage_render_info(c));
+                    self.cages = cages;
+                    self.has_puzzle = true;
+                    self.generation_error = None;
+                }
+                Err(e) => {
+                    self.generation_error = Some(e.to_string());
+                }
+            }
+        }
+    }
+
+    fn cancel_generation(&mut self) {
+        // Drop the receiver — the background thread will see a send error and exit
+        self.generation_status = GenerationStatus::Idle;
     }
 
     fn enter_play_mode(&mut self) {
-        if !self.has_puzzle {
-            self.generate_puzzle();
+        if !self.has_puzzle && !self.is_generating() {
+            self.start_generation();
         }
-        self.mode = Mode::Playing;
-        self.refresh_hints();
+        if self.has_puzzle {
+            self.mode = Mode::Playing;
+            self.refresh_hints();
+        }
     }
 
     fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         while self.running {
+            self.check_generation();
             terminal.draw(|frame| self.draw(frame))?;
-            self.handle_events()?;
+
+            // Use poll-based event reading so we can check generation status
+            if event::poll(Duration::from_millis(100))?
+                && let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press
+            {
+                match self.mode {
+                    Mode::Menu => self.handle_menu_input(key.code),
+                    Mode::Playing => self.handle_play_input(key.code),
+                }
+            }
         }
         Ok(())
     }
@@ -154,9 +278,13 @@ impl App {
     }
 
     fn draw_status_line(&self, frame: &mut Frame, area: Rect) {
-        let text = match self.mode {
-            Mode::Menu => "  ↑↓ Navigate  Enter Select  q Quit",
-            Mode::Playing => "  ↑↓←→ Move  1-9 Set  Bksp Clear  ? Hint  Tab Fill  e Errors  q Menu",
+        let text = if self.is_generating() {
+            "  Generating...  Esc Cancel"
+        } else {
+            match self.mode {
+                Mode::Menu => "  ↑↓ Navigate  Enter Select  q Quit",
+                Mode::Playing => "  ↑↓←→ Move  1-9 Set  Bksp Clear  ? Hint  Tab Fill  e Errors  q Menu",
+            }
         };
         let line = Line::from(Span::styled(
             text,
@@ -254,6 +382,14 @@ impl App {
                 lines.push(Line::from(Span::styled(format!("{marker}{label}"), style)));
                 lines.push(Line::from(""));
             }
+
+            // Show generation error if any
+            if let Some(ref err) = self.generation_error {
+                lines.push(Line::from(Span::styled(
+                    format!("  Error: {err}"),
+                    Style::default().fg(Color::Red),
+                )));
+            }
         }
 
         let paragraph = Paragraph::new(lines);
@@ -275,6 +411,67 @@ impl App {
     }
 
     fn draw_grid_panel(&self, frame: &mut Frame, area: Rect) {
+        if let GenerationStatus::Generating {
+            started,
+            progress,
+            total,
+            ..
+        } = &self.generation_status
+        {
+            let block = Block::default().borders(Borders::ALL);
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+
+            let elapsed = started.elapsed();
+            let secs = elapsed.as_secs();
+            let timer_text = format!("{secs}.{}s", elapsed.subsec_millis() / 100);
+
+            let current = progress.load(Ordering::Relaxed);
+            let total = *total;
+            let ratio = if total > 0 {
+                (current as f64 / total as f64).min(1.0)
+            } else {
+                0.0
+            };
+
+            let content_height = 5; // text + gap + gauge + gap + hint
+            let [vert] = Layout::vertical([Constraint::Length(content_height)])
+                .flex(ratatui::layout::Flex::Center)
+                .areas(inner);
+            let chunks = Layout::vertical([
+                Constraint::Length(1), // "Generating..."
+                Constraint::Length(1), // spacer
+                Constraint::Length(1), // gauge
+                Constraint::Length(1), // spacer
+                Constraint::Length(1), // timer
+            ])
+            .split(vert);
+
+            // Center horizontally (gauge width 30)
+            let gauge_width = 30u16;
+            let [gauge_area] = Layout::horizontal([Constraint::Length(gauge_width)])
+                .flex(ratatui::layout::Flex::Center)
+                .areas(chunks[2]);
+
+            let msg = Paragraph::new(Text::from("Generating...").centered())
+                .style(Style::default().fg(Color::Yellow));
+            frame.render_widget(msg, chunks[0]);
+
+            let gauge = Gauge::default()
+                .gauge_style(Style::default().fg(Color::Yellow).bg(Color::DarkGray))
+                .ratio(ratio)
+                .label(format!("{current}/{total}"));
+            frame.render_widget(gauge, gauge_area);
+
+            let timer = Paragraph::new(
+                Text::from(format!("Elapsed: {timer_text}")).centered(),
+            )
+            .style(Style::default().fg(Color::DarkGray));
+            frame.render_widget(timer, chunks[4]);
+
+            return;
+        }
+
         if !self.has_puzzle {
             let block = Block::default().borders(Borders::ALL);
             let inner = block.inner(area);
@@ -449,24 +646,20 @@ impl App {
         frame.render_widget(table, centered);
     }
 
-    fn handle_events(&mut self) -> io::Result<()> {
-        if let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            match self.mode {
-                Mode::Menu => self.handle_menu_input(key.code),
-                Mode::Playing => self.handle_play_input(key.code),
-            }
-        }
-        Ok(())
-    }
-
     fn handle_menu_input(&mut self, code: KeyCode) {
+        // During generation, only allow Escape to cancel
+        if self.is_generating() {
+            if matches!(code, KeyCode::Esc) {
+                self.cancel_generation();
+            }
+            return;
+        }
+
         match code {
             KeyCode::Char('q') | KeyCode::Esc => self.running = false,
             KeyCode::Char('d') => self.difficulty = self.difficulty.next(),
             KeyCode::Char('m') => self.game_mode = self.game_mode.next(),
-            KeyCode::Char('n') => self.generate_puzzle(),
+            KeyCode::Char('n') => self.start_generation(),
             KeyCode::Char('p') => self.enter_play_mode(),
             KeyCode::Up => {
                 if self.menu_index > 0 {
@@ -481,7 +674,7 @@ impl App {
             KeyCode::Enter => match self.menu_index {
                 0 => self.difficulty = self.difficulty.next(),
                 1 => self.game_mode = self.game_mode.next(),
-                2 => self.generate_puzzle(),
+                2 => self.start_generation(),
                 3 => self.enter_play_mode(),
                 4 => self.running = false,
                 _ => {}
@@ -547,8 +740,162 @@ impl App {
 }
 
 fn main() -> io::Result<()> {
-    let mut terminal = ratatui::init();
-    let result = App::new().run(&mut terminal);
-    ratatui::restore();
-    result
+    let cli = Cli::parse();
+
+    match cli.command {
+        Some(Command::Generate {
+            mode,
+            difficulty,
+            count,
+            output,
+        }) => run_batch_generate(mode, difficulty, count, &output),
+        None => {
+            let mut terminal = ratatui::init();
+            let result = App::new().run(&mut terminal);
+            ratatui::restore();
+            result
+        }
+    }
+}
+
+fn run_batch_generate(
+    mode: GameMode,
+    difficulty: Difficulty,
+    count: usize,
+    output: &str,
+) -> io::Result<()> {
+    let mut rng = StdRng::from_os_rng();
+    let mut puzzles: Vec<PuzzleOutput> = Vec::with_capacity(count);
+    let mode_str = mode.to_string().to_lowercase();
+    let diff_str = difficulty.to_string().to_lowercase();
+
+    for i in 0..count {
+        let label = format!(
+            "[{}/{}] Generating {} {} puzzle...",
+            i + 1,
+            count,
+            mode_str,
+            diff_str
+        );
+        let start = Instant::now();
+
+        match mode {
+            GameMode::Classic => {
+                print!("{label}");
+                io::stdout().flush()?;
+                let state = generate_puzzle(difficulty, &mut rng);
+                let elapsed = start.elapsed();
+                println!(" done ({:.1}s)", elapsed.as_secs_f64());
+                puzzles.push(puzzle_to_output(&state, &mode_str, &diff_str));
+            }
+            GameMode::Killer => {
+                let max_retries = 3;
+                let mut succeeded = false;
+
+                for retry in 0..=max_retries {
+                    if retry > 0 {
+                        print!(
+                            "[{}/{}] Generating {} {} puzzle... retrying ({}/{})",
+                            i + 1,
+                            count,
+                            mode_str,
+                            diff_str,
+                            retry,
+                            max_retries
+                        );
+                        io::stdout().flush()?;
+                    } else {
+                        print!("{label}");
+                        io::stdout().flush()?;
+                    }
+
+                    let progress = Arc::new(AtomicU32::new(0));
+                    let progress_monitor = Arc::clone(&progress);
+                    let monitor_label = format!(
+                        "[{}/{}] Generating {} {} puzzle...",
+                        i + 1,
+                        count,
+                        mode_str,
+                        diff_str
+                    );
+
+                    let done_flag = Arc::new(AtomicU32::new(0));
+                    let done_monitor = Arc::clone(&done_flag);
+
+                    let monitor = std::thread::spawn(move || {
+                        loop {
+                            std::thread::sleep(Duration::from_millis(500));
+                            if done_monitor.load(Ordering::Relaxed) != 0 {
+                                break;
+                            }
+                            let current = progress_monitor.load(Ordering::Relaxed);
+                            print!(
+                                "\r{} attempt {}/{}",
+                                monitor_label, current, KILLER_TOTAL_ATTEMPTS
+                            );
+                            let _ = io::stdout().flush();
+                        }
+                    });
+
+                    let result = generate_killer_puzzle(difficulty, &mut rng, &progress);
+                    done_flag.store(1, Ordering::Relaxed);
+                    let _ = monitor.join();
+
+                    match result {
+                        Ok(state) => {
+                            let elapsed = start.elapsed();
+                            println!(
+                                "\r{} done ({:.1}s)          ",
+                                label,
+                                elapsed.as_secs_f64()
+                            );
+                            puzzles.push(puzzle_to_output(&state, &mode_str, &diff_str));
+                            succeeded = true;
+                            break;
+                        }
+                        Err(_) => {
+                            if retry == max_retries {
+                                println!(
+                                    "\r{} failed (skipped after {} retries)          ",
+                                    label, max_retries
+                                );
+                            } else {
+                                print!("\r{} failed (retrying)          \n", label);
+                            }
+                        }
+                    }
+                }
+
+                if !succeeded {
+                    continue;
+                }
+            }
+        }
+    }
+
+    let json = serde_json::to_string_pretty(&puzzles)
+        .map_err(io::Error::other)?;
+    fs::write(output, json)?;
+    println!("Wrote {} puzzles to {}", puzzles.len(), output);
+    Ok(())
+}
+
+fn puzzle_to_output(state: &PuzzleState, mode: &str, difficulty: &str) -> PuzzleOutput {
+    let cages = state.cages.as_ref().map(|cages| {
+        cages
+            .iter()
+            .map(|cage| CageOutput {
+                cells: cage.cells.iter().map(|&(r, c)| [r, c]).collect(),
+                sum: cage.sum,
+            })
+            .collect()
+    });
+
+    PuzzleOutput {
+        mode: mode.to_string(),
+        difficulty: difficulty.to_string(),
+        grid: *state.grid.cells(),
+        givens: state.givens,
+        cages,
+    }
 }
