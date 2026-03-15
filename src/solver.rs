@@ -285,24 +285,77 @@ fn solve_recursive_cp(state: &CpState, count: &mut usize, limit: usize) {
 // Killer-aware solver
 // ---------------------------------------------------------------------------
 
-/// Count solutions for a killer sudoku (empty grid + cage constraints).
-/// Stops early once `limit` is reached. Returns a value in `0..=limit`.
-pub fn count_solutions_killer(grid: &Grid, cages: &[Cage], limit: usize) -> usize {
-    let Some(state) = KillerCpState::from_grid_with_cages(grid, cages) else {
-        return 0;
-    };
-    let mut count = 0;
-    solve_recursive_killer(&state, &mut count, limit);
-    count
+/// Immutable cage topology — created once, shared by reference across branches.
+pub struct CageInfo {
+    cells: Vec<Vec<(usize, usize)>>,
+    sums: Vec<u8>,
+    cell_cage: [[usize; 9]; 9],
 }
 
-#[derive(Clone)]
+impl CageInfo {
+    fn from_cages(cages: &[Cage]) -> Self {
+        let mut cell_cage = [[0usize; 9]; 9];
+        let mut cells = Vec::with_capacity(cages.len());
+        let mut sums = Vec::with_capacity(cages.len());
+
+        for (i, cage) in cages.iter().enumerate() {
+            for &(r, c) in &cage.cells {
+                cell_cage[r][c] = i;
+            }
+            cells.push(cage.cells.clone());
+            sums.push(cage.sum);
+        }
+
+        CageInfo {
+            cells,
+            sums,
+            cell_cage,
+        }
+    }
+
+    fn num_cages(&self) -> usize {
+        self.cells.len()
+    }
+}
+
+/// Per-cage mutable state — cheap to copy (no heap allocations).
+#[derive(Clone, Copy)]
 struct KillerCageState {
-    cells: Vec<(usize, usize)>,
-    sum: u8,
     placed_mask: u16,
     placed_sum: u8,
     remaining: u8,
+}
+
+/// Result from count_solutions_killer indicating whether the node limit was hit.
+pub enum SolverResult {
+    /// Completed within node budget. Value is solution count (capped at `limit`).
+    Complete(usize),
+    /// Exceeded node budget — result is indeterminate.
+    Exhausted,
+}
+
+/// Count solutions for a killer sudoku (empty grid + cage constraints).
+/// Stops early once `limit` is reached. Returns a value in `0..=limit`.
+/// `node_limit` caps the number of backtracking branches explored (0 = unlimited).
+pub fn count_solutions_killer(
+    grid: &Grid,
+    cages: &[Cage],
+    limit: usize,
+    node_limit: u64,
+) -> SolverResult {
+    let info = CageInfo::from_cages(cages);
+    let Some(state) = KillerCpState::from_grid_with_cages(grid, &info) else {
+        return SolverResult::Complete(0);
+    };
+    let mut count = 0;
+    let mut nodes = 0u64;
+    let effective_node_limit = if node_limit == 0 { u64::MAX } else { node_limit };
+    solve_recursive_killer(&state, &info, &mut count, limit, &mut nodes, effective_node_limit);
+    if nodes >= effective_node_limit {
+        SolverResult::Exhausted
+    } else {
+        SolverResult::Complete(count)
+    }
 }
 
 #[derive(Clone)]
@@ -311,24 +364,17 @@ struct KillerCpState {
     candidates: [[u16; 9]; 9],
     empty_count: u8,
     cage_states: Vec<KillerCageState>,
-    cell_cage: [[usize; 9]; 9],
 }
 
 impl KillerCpState {
-    fn from_grid_with_cages(grid: &Grid, cages: &[Cage]) -> Option<Self> {
-        let mut cell_cage = [[0usize; 9]; 9];
-        let mut cage_states = Vec::with_capacity(cages.len());
+    fn from_grid_with_cages(grid: &Grid, info: &CageInfo) -> Option<Self> {
+        let mut cage_states = Vec::with_capacity(info.num_cages());
 
-        for (i, cage) in cages.iter().enumerate() {
-            for &(r, c) in &cage.cells {
-                cell_cage[r][c] = i;
-            }
+        for i in 0..info.num_cages() {
             cage_states.push(KillerCageState {
-                cells: cage.cells.clone(),
-                sum: cage.sum,
                 placed_mask: 0,
                 placed_sum: 0,
-                remaining: cage.cells.len() as u8,
+                remaining: info.cells[i].len() as u8,
             });
         }
 
@@ -337,7 +383,6 @@ impl KillerCpState {
             candidates: [[0x3FEu16; 9]; 9], // bits 1-9
             empty_count: 0,
             cage_states,
-            cell_cage,
         };
 
         // Count empties and copy filled cells
@@ -355,14 +400,12 @@ impl KillerCpState {
 
         // Initial cage candidate pruning: restrict candidates to digits that
         // appear in at least one valid combination for each cage.
-        for ci in 0..state.cage_states.len() {
-            let cs = &state.cage_states[ci];
-            let key = (cs.cells.len(), cs.sum);
+        for ci in 0..info.num_cages() {
+            let key = (info.cells[ci].len(), info.sums[ci]);
             let combos = CAGE_COMBOS.get(&key)?;
             // Union of all valid combo digits
             let valid_digits: u16 = combos.iter().copied().fold(0u16, |acc, m| acc | m);
-            let cells = cs.cells.clone();
-            for &(r, c) in &cells {
+            for &(r, c) in &info.cells[ci] {
                 if state.cells[r][c] == 0 {
                     state.candidates[r][c] &= valid_digits;
                     if state.candidates[r][c] == 0 {
@@ -376,7 +419,7 @@ impl KillerCpState {
         for r in 0..9 {
             for c in 0..9 {
                 let v = grid.get(r, c);
-                if v != 0 && !state.place(r, c, v) {
+                if v != 0 && !state.place(r, c, v, info) {
                     return None;
                 }
             }
@@ -385,15 +428,15 @@ impl KillerCpState {
         Some(state)
     }
 
-    fn eliminate_from_peers(&mut self, row: usize, col: usize, d: u8) -> bool {
+    fn eliminate_from_peers(&mut self, row: usize, col: usize, d: u8, info: &CageInfo) -> bool {
         let bit = 1u16 << d;
         for c in 0..9 {
-            if c != col && !self.eliminate(row, c, d, bit) {
+            if c != col && !self.eliminate(row, c, d, bit, info) {
                 return false;
             }
         }
         for r in 0..9 {
-            if r != row && !self.eliminate(r, col, d, bit) {
+            if r != row && !self.eliminate(r, col, d, bit, info) {
                 return false;
             }
         }
@@ -401,7 +444,7 @@ impl KillerCpState {
         let bc = (col / 3) * 3;
         for r in br..br + 3 {
             for c in bc..bc + 3 {
-                if (r != row || c != col) && !self.eliminate(r, c, d, bit) {
+                if (r != row || c != col) && !self.eliminate(r, c, d, bit, info) {
                     return false;
                 }
             }
@@ -409,7 +452,7 @@ impl KillerCpState {
         true
     }
 
-    fn eliminate(&mut self, row: usize, col: usize, d: u8, bit: u16) -> bool {
+    fn eliminate(&mut self, row: usize, col: usize, d: u8, bit: u16, info: &CageInfo) -> bool {
         let cands = &mut self.candidates[row][col];
         if *cands & bit == 0 {
             return true;
@@ -421,24 +464,24 @@ impl KillerCpState {
         }
         if remaining & (remaining - 1) == 0 {
             let sole = remaining.trailing_zeros() as u8;
-            if !self.place(row, col, sole) {
+            if !self.place(row, col, sole, info) {
                 return false;
             }
         }
         // Hidden singles in row
-        if !self.check_hidden_single_row(row, d, bit) {
+        if !self.check_hidden_single_row(row, d, bit, info) {
             return false;
         }
-        if !self.check_hidden_single_col(col, d, bit) {
+        if !self.check_hidden_single_col(col, d, bit, info) {
             return false;
         }
-        if !self.check_hidden_single_box(row, col, d, bit) {
+        if !self.check_hidden_single_box(row, col, d, bit, info) {
             return false;
         }
         true
     }
 
-    fn check_hidden_single_row(&mut self, row: usize, d: u8, bit: u16) -> bool {
+    fn check_hidden_single_row(&mut self, row: usize, d: u8, bit: u16, info: &CageInfo) -> bool {
         for c in 0..9 {
             if self.cells[row][c] == d {
                 return true;
@@ -458,10 +501,10 @@ impl KillerCpState {
         if count == 0 {
             return false;
         }
-        self.place(row, last_col, d)
+        self.place(row, last_col, d, info)
     }
 
-    fn check_hidden_single_col(&mut self, col: usize, d: u8, bit: u16) -> bool {
+    fn check_hidden_single_col(&mut self, col: usize, d: u8, bit: u16, info: &CageInfo) -> bool {
         for r in 0..9 {
             if self.cells[r][col] == d {
                 return true;
@@ -481,10 +524,17 @@ impl KillerCpState {
         if count == 0 {
             return false;
         }
-        self.place(last_row, col, d)
+        self.place(last_row, col, d, info)
     }
 
-    fn check_hidden_single_box(&mut self, row: usize, col: usize, d: u8, bit: u16) -> bool {
+    fn check_hidden_single_box(
+        &mut self,
+        row: usize,
+        col: usize,
+        d: u8,
+        bit: u16,
+        info: &CageInfo,
+    ) -> bool {
         let br = (row / 3) * 3;
         let bc = (col / 3) * 3;
         for r in br..br + 3 {
@@ -512,46 +562,55 @@ impl KillerCpState {
         if count == 0 {
             return false;
         }
-        self.place(last_r, last_c, d)
+        self.place(last_r, last_c, d, info)
     }
 
-    fn place(&mut self, row: usize, col: usize, d: u8) -> bool {
+    fn place(&mut self, row: usize, col: usize, d: u8, info: &CageInfo) -> bool {
         self.cells[row][col] = d;
         self.empty_count -= 1;
         self.candidates[row][col] = 0;
 
+        // Update cage state BEFORE peer propagation, so recursive placements
+        // in the same cage see correct placed_mask/placed_sum/remaining.
+        let ci = info.cell_cage[row][col];
+        {
+            let cs = &mut self.cage_states[ci];
+            cs.placed_mask |= 1u16 << d;
+            cs.placed_sum += d;
+            cs.remaining -= 1;
+        }
+
         // Standard row/col/box propagation
-        if !self.eliminate_from_peers(row, col, d) {
+        if !self.eliminate_from_peers(row, col, d, info) {
             return false;
         }
 
-        // Cage propagation
-        let ci = self.cell_cage[row][col];
-        let cs = &mut self.cage_states[ci];
-        cs.placed_mask |= 1u16 << d;
-        cs.placed_sum += d;
-        cs.remaining -= 1;
-
+        // Cage propagation (re-read state since propagation may have updated it)
+        let cs = self.cage_states[ci];
         if cs.remaining == 0 {
             // All cells filled — verify sum
-            if cs.placed_sum != cs.sum {
+            if cs.placed_sum != info.sums[ci] {
                 return false;
             }
         } else {
+            // Sum-range pruning: check if remaining sum is achievable
+            if !self.check_sum_range(ci, info) {
+                return false;
+            }
+
             // Eliminate placed digit from other unfilled cage cells
-            let cage_cells = cs.cells.clone();
             let bit = 1u16 << d;
-            for &(cr, cc) in &cage_cells {
+            for &(cr, cc) in &info.cells[ci] {
                 if self.cells[cr][cc] == 0
                     && self.candidates[cr][cc] & bit != 0
-                    && !self.eliminate(cr, cc, d, bit)
+                    && !self.eliminate(cr, cc, d, bit, info)
                 {
                     return false;
                 }
             }
 
             // Combination pruning: filter valid combos, intersect with candidates
-            if !self.prune_cage_combos(ci) {
+            if !self.prune_cage_combos(ci, info) {
                 return false;
             }
         }
@@ -559,11 +618,36 @@ impl KillerCpState {
         true
     }
 
+    /// Check if the remaining sum for a cage is achievable given available digits.
+    fn check_sum_range(&self, ci: usize, info: &CageInfo) -> bool {
+        let cs = self.cage_states[ci];
+        let remaining_sum = info.sums[ci].wrapping_sub(cs.placed_sum);
+        let remaining_count = cs.remaining as u32;
+
+        // Collect available digits across unfilled cells, excluding already-placed digits
+        let mut available: u16 = 0;
+        for &(r, c) in &info.cells[ci] {
+            if self.cells[r][c] == 0 {
+                available |= self.candidates[r][c] & !cs.placed_mask;
+            }
+        }
+
+        let n_available = available.count_ones();
+        if n_available < remaining_count {
+            return false;
+        }
+
+        let min_sum = smallest_n_sum(available, remaining_count);
+        let max_sum = largest_n_sum(available, remaining_count);
+
+        remaining_sum >= min_sum && remaining_sum <= max_sum
+    }
+
     /// Filter cage combinations to those compatible with already-placed digits,
     /// then restrict unfilled cell candidates to the union of remaining digits.
-    fn prune_cage_combos(&mut self, ci: usize) -> bool {
-        let cs = &self.cage_states[ci];
-        let key = (cs.cells.len(), cs.sum);
+    fn prune_cage_combos(&mut self, ci: usize, info: &CageInfo) -> bool {
+        let cs = self.cage_states[ci];
+        let key = (info.cells[ci].len(), info.sums[ci]);
         let Some(combos) = CAGE_COMBOS.get(&key) else {
             return false;
         };
@@ -589,8 +673,7 @@ impl KillerCpState {
             return false;
         }
 
-        let cage_cells = cs.cells.clone();
-        for &(cr, cc) in &cage_cells {
+        for &(cr, cc) in &info.cells[ci] {
             if self.cells[cr][cc] == 0 {
                 let old = self.candidates[cr][cc];
                 let restricted = old & valid_remaining;
@@ -604,7 +687,7 @@ impl KillerCpState {
                     let bit = bits & bits.wrapping_neg();
                     let digit = bit.trailing_zeros() as u8;
                     bits &= !bit;
-                    if !self.eliminate(cr, cc, digit, bit) {
+                    if !self.eliminate(cr, cc, digit, bit, info) {
                         return false;
                     }
                 }
@@ -613,6 +696,33 @@ impl KillerCpState {
 
         true
     }
+}
+
+/// Sum of the smallest `n` digits from the bitmask.
+fn smallest_n_sum(mut available: u16, n: u32) -> u8 {
+    let mut sum = 0u8;
+    let mut picked = 0u32;
+    while available != 0 && picked < n {
+        let bit = available & available.wrapping_neg();
+        sum += bit.trailing_zeros() as u8;
+        available &= !bit;
+        picked += 1;
+    }
+    sum
+}
+
+/// Sum of the largest `n` digits from the bitmask.
+fn largest_n_sum(available: u16, n: u32) -> u8 {
+    let mut sum = 0u8;
+    let mut picked = 0u32;
+    let mut remaining = available;
+    while remaining != 0 && picked < n {
+        let highest_bit = 1u16 << (15 - remaining.leading_zeros());
+        sum += highest_bit.trailing_zeros() as u8;
+        remaining &= !highest_bit;
+        picked += 1;
+    }
+    sum
 }
 
 fn find_mrv_cell_killer(state: &KillerCpState) -> Option<(usize, usize)> {
@@ -636,8 +746,15 @@ fn find_mrv_cell_killer(state: &KillerCpState) -> Option<(usize, usize)> {
     best
 }
 
-fn solve_recursive_killer(state: &KillerCpState, count: &mut usize, limit: usize) {
-    if *count >= limit {
+fn solve_recursive_killer(
+    state: &KillerCpState,
+    info: &CageInfo,
+    count: &mut usize,
+    limit: usize,
+    nodes: &mut u64,
+    node_limit: u64,
+) {
+    if *count >= limit || *nodes >= node_limit {
         return;
     }
 
@@ -656,10 +773,15 @@ fn solve_recursive_killer(state: &KillerCpState, count: &mut usize, limit: usize
         let d = bit.trailing_zeros() as u8;
         cands &= !bit;
 
+        *nodes += 1;
+        if *nodes >= node_limit {
+            return;
+        }
+
         let mut branch = state.clone();
-        if branch.place(row, col, d) {
-            solve_recursive_killer(&branch, count, limit);
-            if *count >= limit {
+        if branch.place(row, col, d, info) {
+            solve_recursive_killer(&branch, info, count, limit, nodes, node_limit);
+            if *count >= limit || *nodes >= node_limit {
                 return;
             }
         }
@@ -669,7 +791,7 @@ fn solve_recursive_killer(state: &KillerCpState, count: &mut usize, limit: usize
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generator::{fill_grid, generate_cages};
+    use crate::generator::{Difficulty, fill_grid, generate_cages};
     use rand::SeedableRng;
     use rand::rngs::StdRng;
 
@@ -716,7 +838,8 @@ mod tests {
                 })
             })
             .collect();
-        assert_eq!(count_solutions_killer(&Grid::empty(), &cages, 2), 1);
+        let result = count_solutions_killer(&Grid::empty(), &cages, 2, 0);
+        assert!(matches!(result, SolverResult::Complete(1)));
     }
 
     #[test]
@@ -724,9 +847,14 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
         let mut solution = Grid::empty();
         fill_grid(&mut solution, &mut rng);
-        let cages = generate_cages(&solution, &mut rng);
-        let count = count_solutions_killer(&Grid::empty(), &cages, 2);
-        assert!(count >= 1, "solver should find at least 1 solution");
+        let cages = generate_cages(&solution, Difficulty::Easy, &mut rng);
+        let result = count_solutions_killer(&Grid::empty(), &cages, 2, 0);
+        match result {
+            SolverResult::Complete(count) => {
+                assert!(count >= 1, "solver should find at least 1 solution");
+            }
+            SolverResult::Exhausted => panic!("solver exhausted node limit"),
+        }
     }
 
     #[test]
@@ -782,5 +910,30 @@ mod tests {
         g.set(0, 0, 0);
         g.set(0, 1, 5);
         assert_eq!(count_solutions(&g, 2), 0);
+    }
+
+    #[test]
+    fn smallest_n_sum_works() {
+        // available = {1, 2, 3, 5, 9}, pick smallest 3 → 1+2+3=6
+        let avail = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5) | (1 << 9);
+        assert_eq!(smallest_n_sum(avail, 3), 6);
+    }
+
+    #[test]
+    fn largest_n_sum_works() {
+        // available = {1, 2, 3, 5, 9}, pick largest 3 → 9+5+3=17
+        let avail = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5) | (1 << 9);
+        assert_eq!(largest_n_sum(avail, 3), 17);
+    }
+
+    #[test]
+    fn node_limit_exhausts() {
+        // With a very small node limit, the solver should exhaust
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut solution = Grid::empty();
+        fill_grid(&mut solution, &mut rng);
+        let cages = generate_cages(&solution, Difficulty::Hard, &mut rng);
+        let result = count_solutions_killer(&Grid::empty(), &cages, 2, 1);
+        assert!(matches!(result, SolverResult::Exhausted));
     }
 }
