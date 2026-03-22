@@ -207,6 +207,7 @@ pub struct PuzzleState {
     pub grid: Grid,
     pub givens: [[bool; 9]; 9],
     pub cages: Option<Vec<Cage>>,
+    pub solution: Grid,
 }
 
 #[cfg(test)]

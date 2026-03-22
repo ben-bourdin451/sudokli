@@ -55,6 +55,7 @@ struct PuzzleOutput {
     mode: String,
     difficulty: String,
     rating: u8,
+    solution: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     grid: Option<[[u8; 9]; 9]>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -98,6 +99,7 @@ enum GenerationStatus {
 struct App {
     grid: Grid,
     givens: [[bool; 9]; 9],
+    solution: Grid,
     running: bool,
     difficulty: Difficulty,
     game_mode: GameMode,
@@ -108,8 +110,10 @@ struct App {
     mode: Mode,
     cursor_row: usize,
     cursor_col: usize,
-    hints: Vec<(usize, usize, u8)>,
+    obvious_hints: Vec<(usize, usize, u8)>,
+    all_hints: Vec<(usize, usize, u8)>,
     hint_index: usize,
+    show_non_obvious: bool,
     show_errors: bool,
     generation_status: GenerationStatus,
     generation_error: Option<String>,
@@ -120,6 +124,7 @@ impl App {
         Self {
             grid: Grid::empty(),
             givens: [[false; 9]; 9],
+            solution: Grid::empty(),
             running: true,
             difficulty: Difficulty::default(),
             game_mode: GameMode::default(),
@@ -130,8 +135,10 @@ impl App {
             mode: Mode::default(),
             cursor_row: 0,
             cursor_col: 0,
-            hints: Vec::new(),
+            obvious_hints: Vec::new(),
+            all_hints: Vec::new(),
             hint_index: 0,
+            show_non_obvious: false,
             show_errors: false,
             generation_status: GenerationStatus::Idle,
             generation_error: None,
@@ -139,21 +146,67 @@ impl App {
     }
 
     fn refresh_hints(&mut self) {
-        self.hints.clear();
+        self.obvious_hints.clear();
+        self.all_hints.clear();
+        self.show_non_obvious = false;
+
+        // Build cell-to-cage lookup for killer mode
+        let cage_lookup: Option<[[Option<usize>; 9]; 9]> = self.cages.as_ref().map(|cages| {
+            let mut lookup = [[None; 9]; 9];
+            for (i, cage) in cages.iter().enumerate() {
+                for &(r, c) in &cage.cells {
+                    lookup[r][c] = Some(i);
+                }
+            }
+            lookup
+        });
+
         for r in 0..9 {
             for c in 0..9 {
                 if self.grid.get(r, c) == 0 && !self.givens[r][c] {
-                    let cands = self.grid.candidates(r, c);
+                    let val = self.solution.get(r, c);
+                    self.all_hints.push((r, c, val));
+
+                    let mut cands = self.grid.candidates(r, c);
+
+                    // Further constrain by cage if in killer mode
+                    if let Some(ref lookup) = cage_lookup
+                        && let Some(ci) = lookup[r][c]
+                    {
+                        let cage = &self.cages.as_ref().unwrap()[ci];
+                        let mut used = 0u16;
+                        let mut filled_sum: u8 = 0;
+                        let mut empty_count: usize = 0;
+                        for &(cr, cc) in &cage.cells {
+                            let v = self.grid.get(cr, cc);
+                            if v != 0 {
+                                used |= 1 << v;
+                                filled_sum += v;
+                            } else {
+                                empty_count += 1;
+                            }
+                        }
+                        let remaining_sum = cage.sum - filled_sum;
+                        cands.retain(|&d| {
+                            used & (1 << d) == 0
+                                && (empty_count > 1 || d == remaining_sum)
+                        });
+                    }
+
                     if cands.len() == 1 {
-                        self.hints.push((r, c, cands[0]));
+                        self.obvious_hints.push((r, c, val));
                     }
                 }
             }
         }
-        if self.hints.is_empty() {
-            self.hint_index = 0;
+        self.hint_index = 0;
+    }
+
+    fn active_hints(&self) -> &[(usize, usize, u8)] {
+        if self.show_non_obvious {
+            &self.all_hints
         } else {
-            self.hint_index = self.hint_index.min(self.hints.len() - 1);
+            &self.obvious_hints
         }
     }
 
@@ -162,7 +215,7 @@ impl App {
             .flat_map(|r| (0..9).map(move |c| (r, c)))
             .filter(|&(r, c)| {
                 let val = self.grid.get(r, c);
-                val != 0 && !self.givens[r][c] && !self.grid.is_valid_placement(r, c, val)
+                val != 0 && !self.givens[r][c] && val != self.solution.get(r, c)
             })
             .count()
     }
@@ -210,9 +263,10 @@ impl App {
         if let Some(result) = received {
             self.generation_status = GenerationStatus::Idle;
             match result {
-                Ok(PuzzleState { grid, givens, cages }) => {
+                Ok(PuzzleState { grid, givens, cages, solution }) => {
                     self.grid = grid;
                     self.givens = givens;
+                    self.solution = solution;
                     self.cage_render = cages.as_ref().map(|c| compute_cage_render_info(c));
                     self.cages = cages;
                     self.has_puzzle = true;
@@ -326,20 +380,42 @@ impl App {
                 "── Hints ──────────────",
                 Style::default().fg(Color::DarkGray),
             )));
-            if self.hints.is_empty() {
+            let active = self.active_hints();
+            if active.is_empty() && self.all_hints.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "  No unsolved cells",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            } else if active.is_empty() {
                 lines.push(Line::from(Span::styled(
                     "  No obvious moves",
                     Style::default().fg(Color::DarkGray),
                 )));
-            } else {
                 lines.push(Line::from(Span::styled(
-                    format!("  {} cells with 1 option", self.hints.len()),
+                    format!("  {} unsolved cells", self.all_hints.len()),
                     Style::default().fg(Color::DarkGray),
                 )));
-                lines.push(Line::from(""));
-                let (r, c, val) = self.hints[self.hint_index];
                 lines.push(Line::from(Span::styled(
-                    format!("  ▸ R{}C{} → {}", r + 1, c + 1, val),
+                    "  Press ? for solution hint",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            } else {
+                if self.show_non_obvious {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {} unsolved cells", active.len()),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                } else {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {} cells with 1 option", active.len()),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                lines.push(Line::from(""));
+                let (r, c, val) = active[self.hint_index];
+                let label = if self.show_non_obvious { "solution" } else { "hint" };
+                lines.push(Line::from(Span::styled(
+                    format!("  ▸ R{}C{} → {} ({})", r + 1, c + 1, val, label),
                     Style::default().fg(Color::Cyan),
                 )));
             }
@@ -530,17 +606,18 @@ impl App {
                         };
 
                         let is_cursor = is_playing && r == self.cursor_row && c == self.cursor_col;
+                        let active = self.active_hints();
                         let is_hint = is_playing
-                            && !self.hints.is_empty()
+                            && !active.is_empty()
                             && {
-                                let (hr, hc, _) = self.hints[self.hint_index];
+                                let (hr, hc, _) = active[self.hint_index];
                                 hr == r && hc == c
                             };
                         let is_given = self.givens[r][c];
                         let is_error = self.show_errors
                             && val != 0
                             && !is_given
-                            && !self.grid.is_valid_placement(r, c, val);
+                            && val != self.solution.get(r, c);
                         let bg_color: Option<Color> = if let Some(ref cr) = self.cage_render {
                             let idx = cr.cage_colors[cr.cage_map[r][c]] as usize;
                             Some(CAGE_PALETTE[idx])
@@ -722,16 +799,24 @@ impl App {
                 }
             }
             KeyCode::Char('?') => {
-                if !self.hints.is_empty() {
-                    self.hint_index = (self.hint_index + 1) % self.hints.len();
-                    let (r, c, _) = self.hints[self.hint_index];
+                let len = self.active_hints().len();
+                if len > 0 {
+                    self.hint_index = (self.hint_index + 1) % len;
+                    let (r, c, _) = self.active_hints()[self.hint_index];
+                    self.cursor_row = r;
+                    self.cursor_col = c;
+                } else if !self.show_non_obvious && !self.all_hints.is_empty() {
+                    // No obvious hints — switch to all hints
+                    self.show_non_obvious = true;
+                    self.hint_index = 0;
+                    let (r, c, _) = self.all_hints[0];
                     self.cursor_row = r;
                     self.cursor_col = c;
                 }
             }
             KeyCode::Char('e') => self.show_errors = !self.show_errors,
             KeyCode::Tab => {
-                if let Some(&(r, c, val)) = self.hints.get(self.hint_index) {
+                if let Some(&(r, c, val)) = self.active_hints().get(self.hint_index) {
                     self.grid.set(r, c, val);
                     self.refresh_hints();
                 }
@@ -906,10 +991,16 @@ fn puzzle_to_output(state: &PuzzleState, mode: &str, difficulty: &str) -> Puzzle
         Some(*state.grid.cells())
     };
 
+    let solution: String = (0..9)
+        .flat_map(|r| (0..9).map(move |c| state.solution.get(r, c)))
+        .map(|d| char::from(b'0' + d))
+        .collect();
+
     PuzzleOutput {
         mode: mode.to_string(),
         difficulty: difficulty.to_string(),
         rating: rating.score,
+        solution,
         grid,
         cages,
     }

@@ -58,6 +58,8 @@ pub fn generate_puzzle(difficulty: Difficulty, rng: &mut impl Rng) -> PuzzleStat
     let mut grid = Grid::empty();
     fill_grid(&mut grid, rng);
 
+    let solution = grid.clone();
+
     let (min_clues, max_clues) = difficulty.clue_range();
     let target_clues = rng.random_range(min_clues..=max_clues);
 
@@ -74,6 +76,7 @@ pub fn generate_puzzle(difficulty: Difficulty, rng: &mut impl Rng) -> PuzzleStat
         grid,
         givens,
         cages: None,
+        solution,
     }
 }
 
@@ -161,6 +164,7 @@ pub fn generate_killer_puzzle(
                         grid: Grid::empty(),
                         givens: [[false; 9]; 9],
                         cages: Some(cages),
+                        solution: solution.clone(),
                     });
                 }
                 SolverResult::Exhausted => continue,
