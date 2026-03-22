@@ -1,5 +1,6 @@
 mod generator;
 mod grid;
+mod rater;
 mod solver;
 
 use std::fs;
@@ -53,6 +54,7 @@ enum Command {
 struct PuzzleOutput {
     mode: String,
     difficulty: String,
+    rating: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
     grid: Option<[[u8; 9]; 9]>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -881,6 +883,12 @@ fn run_batch_generate(
 }
 
 fn puzzle_to_output(state: &PuzzleState, mode: &str, difficulty: &str) -> PuzzleOutput {
+    let rating = if let Some(ref cages) = state.cages {
+        rater::rate_killer_puzzle(&grid::Grid::empty(), cages)
+    } else {
+        rater::rate_puzzle(&state.grid)
+    };
+
     let cages = state.cages.as_ref().map(|cages| {
         cages
             .iter()
@@ -901,6 +909,7 @@ fn puzzle_to_output(state: &PuzzleState, mode: &str, difficulty: &str) -> Puzzle
     PuzzleOutput {
         mode: mode.to_string(),
         difficulty: difficulty.to_string(),
+        rating: rating.score,
         grid,
         cages,
     }

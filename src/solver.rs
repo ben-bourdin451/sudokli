@@ -5,7 +5,7 @@ use crate::grid::{Cage, Grid};
 
 /// Lookup table: (cage_size, target_sum) -> list of valid digit bitmasks.
 /// Each bitmask has bits set for the digits used (bit i = digit i, 1-indexed).
-static CAGE_COMBOS: LazyLock<HashMap<(usize, u8), Vec<u16>>> = LazyLock::new(|| {
+pub(crate) static CAGE_COMBOS: LazyLock<HashMap<(usize, u8), Vec<u16>>> = LazyLock::new(|| {
     let mut map: HashMap<(usize, u8), Vec<u16>> = HashMap::new();
     // Enumerate all non-empty subsets of digits 1-9 (bitmask 0x002..0x3FE)
     for mask in 1u16..512 {
@@ -222,6 +222,9 @@ impl CpState {
 
     /// Place digit `d` in cell (row, col) and propagate. Returns false on contradiction.
     fn place(&mut self, row: usize, col: usize, d: u8) -> bool {
+        if self.cells[row][col] != 0 {
+            return self.cells[row][col] == d;
+        }
         self.cells[row][col] = d;
         self.empty_count -= 1;
         self.candidates[row][col] = 0;
@@ -566,6 +569,9 @@ impl KillerCpState {
     }
 
     fn place(&mut self, row: usize, col: usize, d: u8, info: &CageInfo) -> bool {
+        if self.cells[row][col] != 0 {
+            return self.cells[row][col] == d;
+        }
         self.cells[row][col] = d;
         self.empty_count -= 1;
         self.candidates[row][col] = 0;
@@ -577,7 +583,7 @@ impl KillerCpState {
             let cs = &mut self.cage_states[ci];
             cs.placed_mask |= 1u16 << d;
             cs.placed_sum += d;
-            cs.remaining -= 1;
+            cs.remaining = cs.remaining.saturating_sub(1);
         }
 
         // Standard row/col/box propagation
